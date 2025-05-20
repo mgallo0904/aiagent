@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Project-specific
+.env
+logs/*.log
+temp/
+*.bak
+*.tmp
+
+# Don't ignore keep files
+!.gitkeep
+
+# Application specific
+logs/*
+!logs/.gitkeep
+data/*
+!data/.gitkeep
+archive/
+models/archive/
+*.log
+
+# Jupyter Notebooks
+.ipynb_checkpoints
