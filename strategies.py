@@ -1,6 +1,8 @@
 import operator
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict
+from datetime import datetime, timedelta # Added
+import QuantLib as ql # Added
 
 # Define constants for repeated string literals
 REASON_INSUFFICIENT_DATA = "Insufficient data for underlying stock"
@@ -26,6 +28,68 @@ STRATEGY_ATR_TRAILING_STOP = "ATR Trailing Stop"
 STRATEGY_SIMPLE_CALL_BUYER = "Simple Call Buyer"
 STRATEGY_SIMPLE_PUT_BUYER = "Simple Put Buyer"
 STRATEGY_CALL_ALIAS = "Call"  # Alias for Simple Call Buyer
+
+
+# Added OptionPricer class
+class OptionPricer:
+    def __init__(self, risk_free_rate=0.02, dividend_yield=0.0):
+        self.rf_rate = risk_free_rate
+        self.div_yield = dividend_yield
+        self.day_count = ql.Actual365Fixed()
+        self.calendar = ql.TARGET() # Using TARGET calendar as a common choice
+
+    def _to_ql_date(self, date_py: datetime) -> ql.Date:
+        """Converts python datetime to QuantLib Date."""
+        return ql.Date(date_py.day, date_py.month, date_py.year)
+
+    def price_and_greeks(self, eval_date_py: datetime, spot: float, strike: float, vol: float, expiry_date_py: datetime, option_type: str = 'call'):
+        """Return price, delta, vega for a European option."""
+        eval_date_ql = self._to_ql_date(eval_date_py)
+        ql.Settings.instance().evaluationDate = eval_date_ql
+        
+        maturity_ql = self._to_ql_date(expiry_date_py)
+
+        # Market data
+        spot_handle = ql.QuoteHandle(ql.SimpleQuote(spot))
+        # For vol, using BlackConstantVol. A more advanced setup would use a BlackVolTermStructure.
+        # The 'vol' passed here is assumed to be the annualized implied volatility for the specific option.
+        # If using realized vol, it's a simplification.
+        vol_handle = ql.BlackVolTermStructureHandle(
+            ql.BlackConstantVol(eval_date_ql, self.calendar, vol, self.day_count)
+        )
+        rf_handle = ql.YieldTermStructureHandle(
+            ql.FlatForward(eval_date_ql, self.calendar, self.rf_rate, self.day_count)
+        )
+        dv_handle = ql.YieldTermStructureHandle(
+            ql.FlatForward(eval_date_ql, self.calendar, self.div_yield, self.day_count)
+        )
+
+        # Payoff & process
+        payoff = ql.PlainVanillaPayoff(
+            ql.Option.Call if option_type.lower() == 'call' else ql.Option.Put,
+            strike
+        )
+        exercise = ql.EuropeanExercise(maturity_ql)
+        bs_process = ql.BlackScholesMertonProcess(
+            spot_handle, dv_handle, rf_handle, vol_handle
+        )
+
+        option = ql.VanillaOption(payoff, exercise)
+        option.setPricingEngine(ql.AnalyticEuropeanEngine(bs_process))
+
+        # Ensure calculations are done if evaluation date changed
+        option.recalculate()
+
+        price = option.NPV()
+        delta = option.delta()
+        vega = option.vega() / 100 # Vega is typically per 1% change in vol, so divide by 100 for per 1.0 change
+
+        # Handle cases where Greeks might not be calculated (e.g., deep OTM, near expiry)
+        if price is None or price < 0: price = 0.0 # Price should not be negative
+        if delta is None: delta = 0.0 if option_type.lower() == 'call' and spot < strike else (-1.0 if option_type.lower() == 'put' and spot > strike else 0.5) # Rough estimate
+        if vega is None: vega = 0.0
+        
+        return price, delta, vega
 
 
 @dataclass
@@ -95,6 +159,13 @@ class TradingStrategy:
             "simple_option_otm_pct", 0.02
         )  # 2% OTM for simple call/put buys
         self.params.setdefault("option_quantity", 1)  # Number of contracts
+        
+        # New parameters for pricer and advanced backtesting considerations
+        self.params.setdefault("risk_free_rate", 0.02)
+        self.params.setdefault("dividend_yield", 0.00)
+        self.params.setdefault("target_option_vega_exposure", None) # e.g., 100 means target $100 vega exposure
+        self.params.setdefault("commission_per_contract", 0.65) # Example commission
+        self.params.setdefault("slippage_per_contract", 0.01) # Example slippage per share/contract price
 
         # Parameters for ATR Trailing Stop (can apply to underlying or option price)
         self.params.setdefault("atr_multiplier", 2.0)
@@ -115,6 +186,12 @@ class TradingStrategy:
             STRATEGY_CALL_ALIAS: self._execute_simple_call_buyer,  # Alias
             STRATEGY_SIMPLE_PUT_BUYER: self._execute_simple_put_buyer,
         }
+        
+        # Initialize OptionPricer
+        self.pricer = OptionPricer(
+            risk_free_rate=self.params["risk_free_rate"],
+            dividend_yield=self.params["dividend_yield"]
+        )
 
     def _get_common_indicator_data(self, market_data):
         """Fetches RSI, MA, and current price."""
@@ -180,6 +257,18 @@ class TradingStrategy:
     ) -> Dict[str, Any]:
         rsi, ma, current_price = self._get_common_indicator_data(market_data)
 
+        # Assume market_data can provide the current date for TTE and pricer eval_date
+        # This is a new requirement for the market_data object.
+        try:
+            current_date = market_data.get_current_date()
+            if not isinstance(current_date, datetime):
+                # If it's a pandas Timestamp, convert to datetime
+                current_date = current_date.to_pydatetime()
+        except AttributeError:
+            print(f"Warning: market_data object for {market_data.symbol} does not have get_current_date(). Using datetime.now(). This is not suitable for backtesting.")
+            current_date = datetime.now()
+
+
         if _is_data_insufficient([rsi, ma, current_price]):
             return {
                 "action": ACTION_HOLD,
@@ -206,7 +295,58 @@ class TradingStrategy:
             strike_price = current_price * (
                 1 + config.otm_percentage_direction * strike_otm_pct
             )
-            reason = f"Conditions met for {config.strategy_name}: RSI {rsi_val:.2f} ({config.rsi_operator.__name__} {self.params[config.rsi_threshold_key]}), MA trend favorable (MA {ma_val:.2f} {config.ma_operator.__name__} previous MA), Current Price {current_price:.2f}."
+            
+            # Option Pricing & Greeks Integration
+            estimated_option_price, estimated_delta, estimated_vega = None, None, None
+            quantity = self.params["option_quantity"] # Default quantity
+
+            try:
+                # NOTE: market_data.calculate_volatility() likely gives historical/realized vol.
+                # For option pricing, implied volatility for the specific option is preferred.
+                # This is a simplification and a known area for improvement (use IV surface).
+                current_volatility_series = market_data.calculate_volatility()
+                if _is_data_insufficient([current_volatility_series]) or current_volatility_series.empty:
+                    raise ValueError("Insufficient volatility data.")
+                current_vol = current_volatility_series.iloc[-1]
+                if current_vol <= 0: # Volatility must be positive
+                    raise ValueError(f"Invalid volatility: {current_vol}")
+
+                expiry_date = current_date + timedelta(days=self.params["option_dte"])
+                
+                opt_price, delta, vega = self.pricer.price_and_greeks(
+                    eval_date_py=current_date,
+                    spot=current_price,
+                    strike=strike_price,
+                    vol=current_vol, # Using realized vol as a placeholder for implied vol
+                    expiry_date_py=expiry_date,
+                    option_type=config.action_type.split('_')[-1].lower() # e.g. 'CALL' from 'BUY_CALL'
+                )
+                estimated_option_price = round(opt_price, 2)
+                estimated_delta = round(delta, 4)
+                estimated_vega = round(vega, 4)
+
+                # Vega-based sizing
+                target_vega_exposure = self.params.get("target_option_vega_exposure")
+                if target_vega_exposure is not None and estimated_vega != 0:
+                    calculated_qty = target_vega_exposure / abs(estimated_vega * 100) # Vega is per 1% move, exposure might be dollar based for 1%
+                    # Or if vega from pricer is already per 1.0 change in vol, then abs(estimated_vega)
+                    # The OptionPricer returns vega per 1.0 change (divided by 100 from QL's typical output)
+                    # So, if target_option_vega_exposure is $ for a 1 point change in IV:
+                    calculated_qty = target_vega_exposure / abs(estimated_vega)
+
+
+                    quantity = max(1, round(calculated_qty)) # Ensure at least 1 contract, whole number
+                
+            except Exception as e:
+                print(f"Strategy {config.strategy_name} for {market_data.symbol}: Error during option pricing/sizing: {e}")
+                # Fallback to default quantity or could decide to hold if pricing fails
+                # For now, we'll proceed with default quantity but without price/Greeks info in reason.
+
+            reason_suffix = ""
+            if estimated_option_price is not None:
+                reason_suffix = f" Est. Option Price: ${estimated_option_price:.2f}, Delta: {estimated_delta:.4f}, Vega: {estimated_vega:.4f}. Quantity: {quantity}."
+
+            reason = f"Conditions met for {config.strategy_name}: RSI {rsi_val:.2f} ({config.rsi_operator.__name__} {self.params[config.rsi_threshold_key]}), MA trend favorable (MA {ma_val:.2f} {config.ma_operator.__name__} previous MA), Current Price {current_price:.2f}.{reason_suffix}"
 
             base_details = {
                 "action_type": config.action_type,
@@ -216,7 +356,12 @@ class TradingStrategy:
             }
             action_specific_details = {
                 "strike_price": strike_price,
-                "quantity": self.params["option_quantity"],
+                "quantity": quantity, # Updated quantity
+                "estimated_option_price": estimated_option_price,
+                "estimated_delta": estimated_delta,
+                "estimated_vega": estimated_vega,
+                "commission_per_contract": self.params["commission_per_contract"],
+                "slippage_per_contract": self.params["slippage_per_contract"]
             }
             return self._create_option_action_details_dict(
                 base_details, action_specific_details

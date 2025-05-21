@@ -498,7 +498,7 @@ def print_performance_report(performance_summary: Dict[str, Any]) -> None:
         performance_summary: Output from summarize_performance()
     """
     summary = performance_summary['summary']
-    metrics = performance_summary['overall_metrics']
+    metrics = summary  # Detailed metrics are stored in summary
     drawdowns = performance_summary['drawdowns']
     cycle_metrics = performance_summary['cycle_metrics']
     trade_stats = performance_summary['trade_statistics']

@@ -55,3 +55,19 @@ models/archive/
 
 # Jupyter Notebooks
 .ipynb_checkpoints
+
+# Ignore logs and training outputs
+lightning_logs/
+*.tfevents.*
+*.png
+
+# Python junk
+__pycache__/
+*.pyc
+
+# VSCode or Jupyter stuff
+.ipynb_checkpoints/
+.vscode/
+
+# Virtual environments
+.venv/
