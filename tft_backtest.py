@@ -145,10 +145,18 @@ def train_tft(data: pd.DataFrame,
         "logger": False,
         "enable_checkpointing": False,
     }
-    if torch.cuda.is_available() and gpus > 0:
-        trainer_kwargs["accelerator"] = "gpu"
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built() and gpus > 0: # Check for MPS
+        trainer_kwargs["accelerator"] = "mps"
+        trainer_kwargs["devices"] = 1 # MPS typically uses 1 device
+        logging.info("Using MPS (Apple Silicon GPU) for training.")
+    elif torch.cuda.is_available() and gpus > 0:
+        trainer_kwargs["accelerator"] = "cuda" # Corrected from "gpu" for PyTorch Lightning
         trainer_kwargs["devices"] = gpus
-    # else: let Trainer use default CPU settings
+        logging.info(f"Using CUDA GPU(s): {gpus} for training.")
+    else:
+        trainer_kwargs["accelerator"] = "cpu"
+        # trainer_kwargs["devices"] = "auto" # Or 1 for CPU
+        logging.info("Using CPU for training.")
 
     trainer = Trainer(**trainer_kwargs)
     trainer.fit(tft, train_loader)
