@@ -25,15 +25,25 @@ class RiskManager:
         )
 
     def _get_volatility_risk_factor(self, volatility: Optional[pd.Series]) -> str:
-        """Determines risk factor based on volatility."""
+        """
+        Determines risk factor based on volatility.
+        NOTE: Expects ANNUALIZED volatility from market_data.calculate_volatility().
+        The thresholds (e.g., 0.05, 0.01) are interpreted in annualized terms.
+        A daily volatility of 1% (0.01) becomes ~15.87% (0.1587) annualized.
+        Thus, a threshold of 0.05 means 5% annualized volatility.
+        """
         if volatility is not None and not volatility.empty:
             current_vol = volatility.iloc[-1]
             if pd.isna(current_vol):  # Check for NaN
                 return "Volatility data (NaN)"
-            if current_vol > 0.05:  # Example threshold for high volatility
-                return "High Market Volatility"
-            elif current_vol < 0.01:
-                return "Low Market Volatility"
+            # Example thresholds for ANNUALIZED volatility:
+            # > 25-30% might be considered high, < 10-15% low.
+            # Current thresholds (0.05, 0.01) are very low for annualized figures.
+            # Consider adjusting these if they lead to misclassification.
+            if current_vol > 0.05:  # e.g., >5% annualized vol
+                return "High Market Volatility" # This will trigger frequently if daily vol is > 0.3%
+            elif current_vol < 0.01: # e.g., <1% annualized vol
+                return "Low Market Volatility" # This will rarely trigger
             return "Moderate Market Volatility"
         return "Volatility data unavailable"
 

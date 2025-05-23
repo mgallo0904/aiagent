@@ -24,45 +24,66 @@ except ImportError:
     OPTUNA_AVAILABLE = False
     logger.warning("Optuna not available. Using RandomizedSearchCV instead.")
 
-def prepare_features(data):
+def prepare_features(data, n_forward: int = 3, threshold: float = 0.01):
     """
-    Prepare features from market data for model training.
+    Prepare features and ternary labels from market data for model training.
     
     Args:
-        data: Market data DataFrame
+        data: Market data DataFrame. Expected to have a 'close' column.
+        n_forward: Number of time steps forward to calculate future return for labeling.
+        threshold: Percentage change threshold for defining up/down/neutral moves.
+                   e.g., 0.01 means a 1% change.
         
     Returns:
-        X, y tuple for model training
+        X, y tuple for model training. 'y' will have labels:
+           1: Price increase > threshold
+          -1: Price decrease < -threshold
+           0: Price change between -threshold and threshold (inclusive)
     """
     # Ensure column names are lowercase
     df = data.copy()
     df.columns = [col.lower() for col in df.columns]
     
-    # Create a label column if it doesn't exist
-    if 'label' not in df.columns:
-        # Define prediction horizon (how many bars forward to predict)
-        horizon = 3  # Look ahead 3 bars
+    # Create a label column
+    if 'label' in df.columns:
+        logger.warning("Existing 'label' column found and will be overwritten.")
+
+    # Calculate percentage price move over the n_forward horizon
+    future_price = df["close"].shift(-n_forward)
+    pct_change = (future_price - df["close"]) / df["close"]
+    
+    # Ternary classification:
+    #  1: Significant upward move (price increases by more than threshold)
+    # -1: Significant downward move (price decreases by more than threshold)
+    #  0: No significant change (price move is within +/- threshold)
+    
+    df["label"] = 0  # Default to 0 (no significant change)
+    df.loc[pct_change > threshold, "label"] = 1    # Up move
+    df.loc[pct_change < -threshold, "label"] = -1  # Down move
         
-        # Calculate percentage price move over the horizon
-        future_price = df["close"].shift(-horizon)
-        pct_change = (future_price - df["close"]) / df["close"]
-        
-        # Define significant move threshold (e.g., 1% move)
-        threshold = 0.01  # 1% threshold
-        
-        # Binary classification: 
-        # 1 if price increases by at least threshold% over horizon
-        # 0 if price decreases by at least threshold% over horizon
-        # NaN for small moves (filtered out later)
-        df["label"] = np.nan
-        df.loc[pct_change >= threshold, "label"] = 1  # Significant upward move
-        df.loc[pct_change <= -threshold, "label"] = 0  # Significant downward move
-        
-    # Drop NaN values 
-    df = df.dropna(subset=['label'])
+    # Drop rows where future_price is NaN (due to shift at the end of the DataFrame)
+    # These rows cannot have a valid label.
+    df = df.dropna(subset=['close', future_price.name]) # Ensure close and future price were not NaN to begin with for pct_change calc
+    df = df.dropna(subset=[pct_change.name]) # Drop rows where pct_change itself is NaN (mostly affects end of series)
+                                         # This also effectively removes rows where 'label' could not be determined.
     
     # Extract features and labels
-    X = df.drop(columns=['label'])
+    # Ensure 'label' is not in X. If other columns are purely for labeling (e.g. future_price, pct_change), drop them too.
+    # For now, assuming all other columns in df (after lowercasing) are features.
+    # If 'future_price' or 'pct_change' were added to df, they should be dropped from X.
+    # Let's explicitly drop them if they exist to be safe.
+    features_to_drop = ['label']
+    if future_price.name in df.columns: # future_price.name is usually 'close' if not renamed
+        # Let's be more specific if pct_change was added to df
+        # pct_change.name will be 'close' if future_price.name was 'close'.
+        # It's better to name the intermediate series explicitly.
+        # df['future_price_temp'] = future_price
+        # df['pct_change_temp'] = (df['future_price_temp'] - df["close"]) / df["close"]
+        # Then drop 'future_price_temp' and 'pct_change_temp'.
+        # For now, assuming no intermediate columns were added with those specific names.
+        pass
+
+    X = df.drop(columns=features_to_drop, errors='ignore')
     y = df['label']
     
     return X, y

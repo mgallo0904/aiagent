@@ -276,8 +276,55 @@ class MLModel:
             self.pipeline.fit(X_train, y_processed)
             self.best_params = self.initial_params # Or model_instance.get_params() after fit
         
-        logger.info(f"{self.model_type} training completed.")
-        return self
+        logger.info(f"{self.model_type} training completed on the provided training data.")
+        # Note: Evaluation on a separate test set should be handled by the caller if desired,
+        # by splitting data before calling .fit() or by calling .evaluate() explicitly.
+        # This method focuses on fitting the model to the given X_train, y_train.
+        # To meet the subtask of train/test split INSIDE fit and returning metrics:
+        # This 'fit' method's signature implies it receives already split training data.
+        # For the subtask, we will assume 'fit' is called with the *full* dataset,
+        # and then it performs the 80/20 split internally and returns test metrics.
+
+        # This is unconventional for a 'fit' method. Typically, 'fit' just fits.
+        # A 'fit_and_evaluate' or similar would be more standard for this behavior.
+        # However, proceeding as per subtask interpretation.
+
+        # The subtask implies X_train, y_train ARE the full X, y.
+        # Let's rename them for clarity within this scope if we are to split them here.
+        X_full, y_full_raw = X_train, y_train # y_train is raw, y_processed is encoded for fitting.
+
+        split_point = int(0.8 * len(X_full))
+        if split_point < 1 or split_point >= len(X_full):
+            logger.warning(f"Dataset too small (len: {len(X_full)}) for meaningful 80/20 train/test split. Evaluating on training data.")
+            # Evaluate on training data itself as a fallback.
+            # This means the metrics are in-sample.
+            metrics = self.evaluate(X_full, y_full_raw) # y_full_raw because evaluate handles encoding
+            return metrics # Return in-sample metrics
+
+        X_train_split, X_test_split = X_full.iloc[:split_point], X_full.iloc[split_point:]
+        y_train_raw_split, y_test_raw_split = y_full_raw.iloc[:split_point], y_full_raw.iloc[split_point:]
+        
+        # Re-process y_train_raw_split for fitting if label encoder is used
+        y_train_processed_split = y_train_raw_split
+        if self.label_encoder and self.behavior_config.behavior_type != ModelBehaviorType.REGRESSION:
+            y_train_processed_split = self.label_encoder.fit_transform(y_train_raw_split) # Fit LE only on train part
+            logger.info(f"LabelEncoder classes (re-fitted on train split): {self.label_encoder.classes_}")
+        
+        # Fit the model ONLY on the new training split
+        logger.info(f"Re-fitting model on 80% training split (size: {len(X_train_split)}).")
+        if self.config.use_hyperparameter_search and self.config.hyperparameter_search_budget > 0:
+            self._fit_with_search(X_train_split, y_train_processed_split)
+        else:
+            self.pipeline.fit(X_train_split, y_train_processed_split)
+            self.best_params = self.initial_params
+        logger.info(f"{self.model_type} re-fitting on 80% training data completed.")
+
+        # Evaluate on the 20% test split
+        logger.info(f"Evaluating model on 20% test split (size: {len(X_test_split)}).")
+        test_metrics = self.evaluate(X_test_split, y_test_raw_split) # evaluate handles y encoding internally using the LE fitted on train split
+        
+        logger.info(f"Out-of-sample test metrics: {test_metrics}")
+        return test_metrics # Return the out-of-sample metrics dictionary
 
     def predict(self, X_test: pd.DataFrame) -> np.ndarray:
         """Generate predictions. For classifiers, returns encoded labels."""
@@ -307,14 +354,20 @@ class MLModel:
         
         y_test_encoded = y_test_raw
         if self.label_encoder and self.behavior_config.behavior_type != ModelBehaviorType.REGRESSION:
+            # Ensure LabelEncoder is fitted before transforming y_test_raw
+            if not hasattr(self.label_encoder, 'classes_') or not self.label_encoder.classes_.size:
+                logger.error("LabelEncoder not fitted, cannot transform y_test_raw. Call fit first or ensure y_train was processed.")
+                return {"error": "LabelEncoder not fitted."}
             try:
                 y_test_encoded = self.label_encoder.transform(y_test_raw)
             except ValueError as e:
-                logger.error(f"Error transforming y_test_raw with label encoder: {e}. Unique values in y_test_raw: {y_test_raw.unique()}")
-                # Fallback or re-raise, for now, try to proceed if possible or return empty metrics
-                return {"error": f"Label encoding failed for test set: {e}"}
-
-
+                # This can happen if y_test_raw contains labels not seen during label_encoder.fit_transform(y_train_raw_split)
+                unknown_labels = set(y_test_raw.unique()) - set(self.label_encoder.classes_)
+                logger.error(f"Error transforming y_test_raw with label encoder: {e}. Unknown labels in y_test_raw: {unknown_labels}. LE classes: {self.label_encoder.classes_}")
+                # Fallback: filter y_test_raw and y_pred_encoded to only include known labels for metric calculation
+                # Or, return an error metric. For now, returning error.
+                return {"error": f"Label encoding failed for test set due to unseen labels: {unknown_labels}"}
+        
         metrics = {}
         if self.behavior_config.behavior_type == ModelBehaviorType.REGRESSION:
             metrics['mse'] = mean_squared_error(y_test_encoded, y_pred_encoded)
@@ -347,18 +400,35 @@ class MLModel:
                     try:
                         # Assuming positive class probability is in the column corresponding to its encoded label
                         # If label_encoder.classes_ = [neg_label, pos_label], then proba for pos_label is proba[:,1]
-                        # Find index of positive class
-                        idx_pos = list(self.label_encoder.classes_).index(self.behavior_config.positive_class_label)
-                        metrics['roc_auc'] = roc_auc_score(y_test_encoded, y_pred_proba[:, idx_pos])
-                        logger.info(f"ROC AUC: {metrics['roc_auc']:.4f}")
-                    except ValueError as e:
+                        # Find index of positive class if possible and classes are defined
+                        if hasattr(self.label_encoder, 'classes_') and self.behavior_config.positive_class_label in self.label_encoder.classes_:
+                            idx_pos = list(self.label_encoder.classes_).index(self.behavior_config.positive_class_label)
+                            # Check if y_test_encoded contains both classes after potential filtering
+                            if len(np.unique(y_test_encoded)) > 1:
+                                metrics['roc_auc'] = roc_auc_score(y_test_encoded, y_pred_proba[:, idx_pos])
+                                logger.info(f"ROC AUC: {metrics['roc_auc']:.4f}")
+                            else:
+                                logger.warning(f"ROC AUC not computed for binary: y_test_encoded has only one class after potential filtering: {np.unique(y_test_encoded)}.")
+                        else:
+                             logger.warning(f"Positive class label '{self.behavior_config.positive_class_label}' not found in LabelEncoder or LE not properly fitted. ROC AUC may be misleading or fail.")
+                             # Fallback or attempt with default column if appropriate
+                             if y_pred_proba.shape[1] > 1 and len(np.unique(y_test_encoded)) > 1: # Check if still possible
+                                 metrics['roc_auc'] = roc_auc_score(y_test_encoded, y_pred_proba[:, 1]) # Default to second column
+                                 logger.info(f"ROC AUC (default positive class): {metrics['roc_auc']:.4f}")
+
+                    except ValueError as e: # Catch errors from roc_auc_score itself
                         logger.warning(f"Could not compute ROC AUC for binary: {e}. y_test_encoded unique: {np.unique(y_test_encoded)}. Proba shape: {y_pred_proba.shape}")
-                elif self.behavior_config.behavior_type == ModelBehaviorType.CLASSIFICATION_TERNARY and y_pred_proba.shape[1] == len(self.label_encoder.classes_):
-                    try:
-                        metrics['roc_auc_ovr'] = roc_auc_score(y_test_encoded, y_pred_proba, multi_class='ovr', average='weighted', labels=self.label_encoder.transform(self.label_encoder.classes_))
-                        logger.info(f"ROC AUC (OVR weighted): {metrics['roc_auc_ovr']:.4f}")
-                    except ValueError as e:
-                        logger.warning(f"Could not compute ROC AUC for ternary: {e}. y_test_encoded unique: {np.unique(y_test_encoded)}. Proba shape: {y_pred_proba.shape}")
+                
+                elif self.behavior_config.behavior_type == ModelBehaviorType.CLASSIFICATION_TERNARY and hasattr(self.label_encoder, 'classes_') and y_pred_proba.shape[1] == len(self.label_encoder.classes_):
+                    # Check if y_test_encoded contains multiple classes after potential filtering
+                    if len(np.unique(y_test_encoded)) > 1:
+                        try:
+                            metrics['roc_auc_ovr'] = roc_auc_score(y_test_encoded, y_pred_proba, multi_class='ovr', average='weighted', labels=self.label_encoder.transform(self.label_encoder.classes_))
+                            logger.info(f"ROC AUC (OVR weighted): {metrics['roc_auc_ovr']:.4f}")
+                        except ValueError as e: # Catch errors from roc_auc_score
+                            logger.warning(f"Could not compute ROC AUC for ternary: {e}. y_test_encoded unique: {np.unique(y_test_encoded)}. Proba shape: {y_pred_proba.shape}")
+                    else:
+                        logger.warning(f"ROC AUC not computed for ternary: y_test_encoded has only one class after potential filtering: {np.unique(y_test_encoded)}.")
         return metrics
 
     def find_optimal_threshold(self, X_val: pd.DataFrame, y_val_raw: pd.Series) -> float:
@@ -556,22 +626,144 @@ def perform_walk_forward_backtest(
         # Train the model
         model.fit(X_train, y_train)
 
-        # Generate signals (1, 0, -1) for backtest: 1 for buy, -1 for sell, 0 for hold
-        # Placeholder: implement your signal generation logic based on model predictions
-        signals = model.predict(X_test)  # Assuming model outputs signals directly
+        # Generate signals (1, 0, -1) for backtest based on probabilities
+        signals_list = []
+        probas = model.predict_proba(X_test) # Get probabilities for each class
 
-        # Current prices for this fold
-        current_prices = price_df.iloc[test_indices]
+        if probas is not None and model.label_encoder is not None and hasattr(model.label_encoder, 'classes_'):
+            label_classes = list(model.label_encoder.classes_)
+            proba_threshold = model.behavior_config.proba_threshold # Use threshold from behavior_config
+            
+            # Determine indices for 'Up' (1) and 'Down' (-1) classes
+            # Assuming ternary classification: -1 (Down), 0 (Hold), 1 (Up)
+            try:
+                up_idx = label_classes.index(1)
+            except ValueError:
+                logger.warning("Class '1' (Up) not found in label encoder. Cannot generate 'Up' signals.")
+                up_idx = -1 # Invalid index
+            try:
+                down_idx = label_classes.index(-1)
+            except ValueError:
+                logger.warning("Class '-1' (Down) not found in label encoder. Cannot generate 'Down' signals.")
+                down_idx = -1 # Invalid index
 
-        if not signals.empty and not current_prices.empty:
-            # Unified backtest engine returns a DataFrame with equity column
-            bt_results = run_backtest(
-                price=current_prices,
-                signals=signals.to_numpy(),
-                initial_capital=current_fold_capital,
-                transaction_cost_pct=transaction_cost_pct
-            )
-            equity_curve_fold = bt_results['equity']
+            for p_row in probas:
+                signal = 0 # Default to Hold
+                if up_idx != -1 and p_row[up_idx] > proba_threshold:
+                    signal = 1 # Buy Call
+                elif down_idx != -1 and p_row[down_idx] > proba_threshold:
+                    signal = -1 # Buy Put
+                signals_list.append(signal)
+            
+            signals = pd.Series(signals_list, index=X_test.index)
+            logger.info(f"Generated {len(signals[signals != 0])} non-hold signals out of {len(signals)} using threshold {proba_threshold}.")
+
+        else:
+            logger.warning("Could not generate probability-based signals. Falling back to direct predictions or zeros.")
+            # Fallback: use direct predictions if probas are None, or all zeros if label encoder is missing.
+            direct_preds = model.predict(X_test)
+            # Ensure direct_preds are mapped to 1, -1, 0 if they are not already (e.g. if model predicts class labels directly)
+            # This part depends on what model.predict() returns for the specific model type.
+            # For simplicity, assuming it returns encoded labels that might map to 1, -1, 0.
+            # A safer fallback might be all zeros.
+            signals = pd.Series(np.zeros(len(X_test)), index=X_test.index)
+            if direct_preds is not None:
+                # Attempt to map direct predictions if they seem like class labels
+                # This is a simplified fallback.
+                try:
+                    # Example: if direct_preds are [0,1,2] and classes are [-1,0,1]
+                    # This mapping needs to be robust or clearly defined.
+                    # For now, if direct_preds are already -1,0,1, this is fine.
+                    signals = pd.Series(direct_preds, index=X_test.index)
+                    logger.info(f"Using direct model.predict() for signals. Unique signals: {signals.unique()}")
+                except Exception as e:
+                    logger.error(f"Error mapping direct predictions to signals: {e}")
+
+
+        # Data for the new backtester: test_df already contains price and features (including volatility)
+        # Ensure the required volatility column name is known. Assuming 'annualized_volatility_20' for a 20-day window.
+        # This should be made configurable or dynamically found.
+        # For now, let's assume 'annualized_volatility_20' is in test_df.columns
+        
+        # current_prices_for_backtest = price_df.iloc[test_indices] # This only has 'close'
+        # We need test_df which is combined_df.iloc[test_indices]
+        
+        # TODO: Replace with call to new run_option_strategy_backtest
+        # Get parameters for run_option_strategy_backtest from ModelConfig or use defaults
+        # Assuming ModelConfig might not have a .get() method, using getattr for safety.
+        otm_pct_config = getattr(model_config, 'option_otm_percentage', 0.02)
+        dte_days_config = getattr(model_config, 'option_dte_days', 30)
+        option_hold_days_config = getattr(model_config, 'option_hold_days', 10)
+        commission_config = getattr(model_config, 'option_commission_per_contract', 0.65)
+        risk_free_rate_config = getattr(model_config, 'option_risk_free_rate', 0.01)
+        dividend_yield_config = getattr(model_config, 'option_dividend_yield', 0.00)
+        num_contracts_config = getattr(model_config, 'option_num_contracts_per_trade', 1)
+        option_multiplier_config = getattr(model_config, 'option_multiplier', 100)
+
+        # Ensure current_fold_capital is defined.
+        # For the first fold, it should be initial_capital. For subsequent, it's end capital of previous.
+        if i == 0:
+            current_fold_capital = initial_capital
+        # else: current_fold_capital should be updated from previous fold's end capital
+
+        if not signals.empty and not test_df.empty:
+            # Assuming new backtester is imported as: from backtest import run_option_strategy_backtest
+            # And it exists in backtest.py
+            try:
+                from backtest import run_option_strategy_backtest # Import here
+                
+                # Dynamically find the annualized volatility column
+                volatility_col_name = None
+                for col in test_df.columns:
+                    if col.startswith('annualized_volatility_'):
+                        volatility_col_name = col
+                        logger.info(f"Using volatility column: {volatility_col_name}")
+                        break
+                
+                if volatility_col_name is None:
+                    logger.error(f"No 'annualized_volatility_' column found in test_df. Columns: {test_df.columns}. Skipping option backtest for this fold.")
+                    equity_curve_fold = pd.Series([current_fold_capital] * len(test_df), index=test_df.index) # Flat equity
+                else:
+                    equity_curve_fold = run_option_strategy_backtest(
+                        price_data=test_df, 
+                        signals=signals,
+                        initial_capital=current_fold_capital,
+                        otm_percentage=otm_pct_config,
+                        dte_days=dte_days_config,
+                        option_hold_days=option_hold_days_config,
+                        commission_per_contract=commission_config,
+                        num_contracts_per_trade=num_contracts_config,
+                        option_multiplier=option_multiplier_config,
+                        volatility_column=volatility_col_name,
+                        risk_free_rate=risk_free_rate_config,
+                        dividend_yield=dividend_yield_config
+                    )
+            except ImportError:
+                logger.error("'run_option_strategy_backtest' not found in 'backtest.py'. Falling back to old backtest.")
+                # Fallback to old backtest if new one is not ready (for now)
+                bt_results = run_backtest(
+                    price=test_df[['close']], # Old backtester needs 'price' DataFrame with 'close'
+                    signals=signals.to_numpy(), # Old backtester needs numpy array
+                    initial_capital=current_fold_capital,
+                    transaction_cost_pct=transaction_cost_pct
+                )
+                equity_curve_fold = bt_results['equity']
+            except Exception as e:
+                logger.error(f"Error during option strategy backtest: {e}", exc_info=True)
+                equity_curve_fold = pd.Series([current_fold_capital] * len(test_df), index=test_df.index)
+
+
+            # equity_curve_fold = pd.Series([initial_capital] * len(X_test), index=X_test.index) # Placeholder
+            # logger.warning("Using placeholder equity curve for option backtest.")
+            
+            # Old code:
+            # bt_results = run_backtest(
+            #     price=current_prices,
+            #     signals=signals.to_numpy(),
+            #     initial_capital=current_fold_capital,
+            #     transaction_cost_pct=transaction_cost_pct
+            # )
+            # equity_curve_fold = bt_results['equity']
             trades_fold_df = pd.DataFrame()  # Detailed trades not available in unified engine
 
             equity_curves.append(equity_curve_fold)

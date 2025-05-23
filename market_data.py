@@ -338,12 +338,35 @@ class MarketData:
         if self._has_valid_close_data:
             close_prices = self.data["Close"]
             log_returns = np.log(close_prices / close_prices.shift(1))
+            # Calculate annualized volatility, assuming 252 trading days a year
             volatility = log_returns.rolling(
                 window=window, min_periods=window
-            ).std() * np.sqrt(window)
-            volatility.name = f"volatility_{window}"
+            ).std() * np.sqrt(252)
+            volatility.name = f"annualized_volatility_{window}" # Renamed to reflect annualization
             return volatility
         print(
             f"Data not available or 'Close' column missing/empty for Volatility calculation for {self.symbol}."
         )
         return pd.Series(dtype="float64")
+
+    def get_latest_features(self) -> Optional[pd.DataFrame]:
+        """
+        Returns the latest row of market data (features) as a DataFrame.
+        Ensures column names are lowercase to match training expectations.
+        """
+        if not self._has_valid_data:
+            print(f"Cannot get latest features for {self.symbol}: Data not fetched, empty, or invalid.")
+            return None
+        
+        latest_row_df = self.data.iloc[-1:].copy() # Keep as DataFrame
+        
+        # Ensure column names are lowercase, consistent with how features were prepared for training
+        latest_row_df.columns = [col.lower() for col in latest_row_df.columns]
+        
+        # Optional: Select only columns that would have been used as features during training.
+        # This depends on how 'prepare_features' selects X from the input data.
+        # If 'prepare_features' drops original OHLCV after creating indicators, then no issue.
+        # For now, assume all columns in self.data (after lowercasing) are potential features.
+        # The MLModel.predict method will handle selection based on self.trained_feature_names_.
+        
+        return latest_row_df
