@@ -20,6 +20,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
 
 import optuna
 
@@ -258,25 +260,109 @@ class MLModel:
         self.pipeline.fit(X, y)
         logger.info(f"Model {self.model_type} refitted with best Optuna parameters.")
 
-    def fit(self, X_train: pd.DataFrame, y_train: pd.Series):
-        """Fit the model to the training data, optionally with hyperparameter search."""
+    def train(self, X: pd.DataFrame, y: pd.Series, test_size: float = 0.2):
+        """
+        Train the model on a training set and evaluate on a test set.
+        Data is split chronologically (no shuffle).
+        """
+        if not isinstance(X, pd.DataFrame) or not isinstance(y, pd.Series):
+            logger.error("X must be a pandas DataFrame and y a pandas Series.")
+            return self
+
+        if X.empty or y.empty:
+            logger.error("Input data X or y is empty. Skipping training.")
+            return self
+
+        # Split data into training and testing sets (chronological split)
+        # Ensure test_size is valid
+        if not (0 < test_size < 1):
+            logger.warning(f"Invalid test_size {test_size}. Defaulting to 0.2.")
+            test_size = 0.2
+        
+        # Calculate split index for chronological split
+        split_idx = int(len(X) * (1 - test_size))
+        
+        if split_idx <= 0 or split_idx >= len(X):
+            logger.error(f"Cannot create a valid train/test split with test_size {test_size} for data of length {len(X)}. Training on full dataset instead.")
+            X_train, y_train = X, y
+            X_test, y_test = X.iloc[0:0], y.iloc[0:0] # Empty test set
+        else:
+            X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+            y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        logger.info(f"Data split: {len(X_train)} training samples, {len(X_test)} testing samples.")
+
         if hasattr(X_train, 'columns'):
             self.trained_feature_names_ = list(X_train.columns)
             logger.info(f"Training with features: {self.trained_feature_names_}")
 
-        y_processed = y_train
+        y_train_processed = y_train
         if self.label_encoder and self.behavior_config.behavior_type != ModelBehaviorType.REGRESSION:
-            y_processed = self.label_encoder.fit_transform(y_train)
+            y_train_processed = self.label_encoder.fit_transform(y_train) # Fit encoder ONLY on training data
             logger.info(f"LabelEncoder classes: {self.label_encoder.classes_} for target: {self.config.target_variable_name}")
 
         if self.config.use_hyperparameter_search and self.config.hyperparameter_search_budget > 0:
-            self._fit_with_search(X_train, y_processed)
+            self._fit_with_search(X_train, y_train_processed)
         else:
             logger.info(f"Fitting {self.model_type} with initial parameters (no hyperparameter search).")
-            self.pipeline.fit(X_train, y_processed)
-            self.best_params = self.initial_params # Or model_instance.get_params() after fit
+            self.pipeline.fit(X_train, y_train_processed)
+        self.best_params = self.initial_params
         
-        logger.info(f"{self.model_type} training completed.")
+        # --- Probability Calibration Step ---
+        if self.behavior_config.behavior_type != ModelBehaviorType.REGRESSION and self.config.use_probability_calibration:
+            logger.info(f"Applying probability calibration for {self.model_type}.")
+            # Extract the base model from the pipeline
+            # The pipeline is currently: [('scaler', scaler_instance), ('classifier', model_instance)]
+            # We need to calibrate the 'classifier' (which is self.model_instance)
+            # self.model_instance should already be configured with best_params if HPO was run,
+            # or initial_params otherwise.
+            
+            # Note: _fit_with_search already calls pipeline.fit() on X_train, y_train_processed.
+            # If HPO is used, the model_instance inside the pipeline is already trained.
+            # CalibratedClassifierCV will refit this base estimator on its internal CV folds.
+            
+            base_classifier_for_calibration = self.pipeline.named_steps['classifier']
+            
+            # Some models like SVM need probability=True. Ensured during _init_model_instance for SVC.
+            # For CatBoost, if it's part of a pipeline, CalibratedClassifierCV might have issues
+            # if the base estimator isn't a standard scikit-learn one.
+            # However, CatBoostClassifier has its own calibration options too.
+            # For now, proceeding with general CalibratedClassifierCV wrapper.
+
+            calibration_method = self.config.calibration_method # e.g., 'isotonic' or 'sigmoid'
+            calibration_cv_folds = self.config.calibration_cv_folds # e.g., 3 or 5
+
+            calibrated_model = CalibratedClassifierCV(
+                base_classifier_for_calibration,
+                method=calibration_method,
+                cv=calibration_cv_folds
+                # ensemble=True, # For sklearn >= 1.4, default is True. For older, cv implies ensemble.
+            )
+            
+            # Replace the classifier in the pipeline with the calibrated one
+            # self.pipeline.steps[-1] = ('classifier', calibrated_model) # Less robust
+            self.pipeline.set_params(classifier=calibrated_model) # More robust
+            
+            logger.info(f"Fitting pipeline with {self.model_type} wrapped by CalibratedClassifierCV (method: {calibration_method}, cv: {calibration_cv_folds}).")
+            # Fit the pipeline again, this time CalibratedClassifierCV will handle its process
+            self.pipeline.fit(X_train, y_train_processed)
+            logger.info("Probability calibration completed.")
+        else:
+            logger.info(f"{self.model_type} training completed on the training set (no calibration applied or not applicable).")
+
+        # Evaluate on the test set
+        if not X_test.empty:
+            logger.info("Evaluating model performance on the test set...")
+            test_metrics = self.evaluate(X_test, y_test) # y_test is raw, evaluate handles encoding
+            logger.info(f"Test Set Performance Metrics for {self.model_type}:")
+            for metric_name, value in test_metrics.items():
+                if isinstance(value, float):
+                    logger.info(f"  {metric_name}: {value:.4f}")
+                else:
+                    logger.info(f"  {metric_name}: {value}")
+        else:
+            logger.info("Test set is empty. Skipping evaluation on test set.")
+            
         return self
 
     def predict(self, X_test: pd.DataFrame) -> np.ndarray:

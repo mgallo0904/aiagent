@@ -137,10 +137,10 @@ def walkforward_options_backtest(
     # Risk Manager (re-initialize per fold or use one that updates capital?) For now, one instance.
     # risk_mgr = RiskManager(total_capital=initial_capital, ...) # Loaded from CONFIG
 
-    # Trading Strategy instance
-    option_strategy = TradingStrategy(name=option_strategy_name, strategy_config=CONFIG)
+    # ML Model configuration for MLTradingStrategy
+    # No separate TradingStrategy instance like `option_strategy` needed if MLTradingStrategy is primary.
+    # MLTradingStrategy will be instantiated per fold with the trained model.
     
-    # ML Model configuration
     model_behavior_cfg = ModelBehaviorConfig(
         proba_threshold=ml_model_proba_threshold_ui, # From UI/config
         # Use other settings from CONFIG for MLModel
@@ -156,8 +156,16 @@ def walkforward_options_backtest(
     cycle_metrics_list = []
     all_trades_list = [] # To store details of each trade for metrics calculation
 
+    # Create a MarketData instance that MLTradingStrategy can use internally for fetching.
+    # This instance is symbol-specific and will be passed to MLTradingStrategy.
+    # Its state will be managed by MLTradingStrategy's _get_latest_features method.
+    market_data_for_strategy = MarketData(symbol=symbol)
+    # We need to ensure that this market_data_for_strategy.data is populated with enough history
+    # for feature calculation when _get_latest_features is called.
+    # MLTradingStrategy._get_latest_features() calls fetch_historical("1y"), which should be sufficient.
+
     num_cycles = (len(X_all) - train_window) // test_window
-    print(f"Starting Optimized Walk-Forward Options Backtest for {symbol} with {num_cycles} cycles.")
+    print(f"Starting Optimized Walk-Forward Options Backtest for {symbol} with {num_cycles} cycles using MLTradingStrategy.")
 
     for cycle_num in range(num_cycles):
         train_start_idx = cycle_num * test_window
@@ -183,8 +191,22 @@ def walkforward_options_backtest(
                                 behavior_config=model_behavior_cfg)
         # Provide a portion of X_train for early stopping if XGBoost and if desired
         # For simplicity, HPO inside fit will use its own CV splits.
-        ml_model_fold.fit(X_train, y_train) 
+        ml_model_fold.train(X_train, y_train) # Changed from fit to train, if MLModel was updated to use 'train'
         print(f"  ML Model trained for cycle {cycle_num+1}.")
+
+        # Instantiate MLTradingStrategy for this fold
+        ml_strategy_fold = MLTradingStrategy(
+            ml_model=ml_model_fold,
+            market_data_provider=market_data_for_strategy, # Pass the dedicated MD instance
+            strategy_params={
+                "option_dte": CONFIG.get("DEFAULT_OPTION_DTE_MAX", 45),
+                "prediction_horizon": CONFIG.get("ML_PREDICTION_HORIZON", 1), # Ensure these match model
+                "dynamic_threshold_factor": CONFIG.get("ML_THRESHOLD_FACTOR", 0.5),
+                "commission_per_contract": transaction_cost_options, # Use backtest param
+                # action_mapping can be customized here if needed
+            }
+        )
+        print(f"  MLTradingStrategy instantiated for cycle {cycle_num+1}.")
 
         # --- Simulate trading within the test window (day by day) ---
         for i in range(len(prices_test_cycle)):
@@ -244,76 +266,66 @@ def walkforward_options_backtest(
 
             # If no active trade, check for entry signals for the current day
             if not active_option_trade:
-                # Get ML prediction for current day (using features up to previous day)
-                # X_test_cycle contains features for the test period.
-                # The feature for current_date is X_test_cycle.loc[current_date]
-                if current_date in X_test_cycle.index:
-                    current_features = X_test_cycle.loc[[current_date]] # Needs to be DataFrame
-                    # predict_proba returns P(UP) for binary classification
-                    ml_signal_proba_up = ml_model_fold.predict_proba(current_features)
-                    
-                    if ml_signal_proba_up is not None and len(ml_signal_proba_up) > 0:
-                        ml_signal_proba_up = ml_signal_proba_up[0] # Get the probability float
-                        
-                        # Prepare ML output for strategy
-                        ml_output_for_strategy = {'probability': ml_signal_proba_up}
-                        
-                        # MarketData object needs to be for the current state (not a full historical MD object)
-                        # This is tricky. Strategy expects a MarketData object.
-                        # For now, let's create a temporary MD object or pass relevant data.
-                        # Simplified: pass current price, options_snapshot, IV rank to strategy.
-                        # The strategy's `execute` method needs to be adapted or a helper used.
-                        
-                        # Let's assume the strategy's core logic for picking an option can be called.
-                        # We need current underlying price, all available options (snapshot), and IV rank.
-                        
-                        # Construct a temporary MarketData-like structure or pass raw data
-                        temp_market_view = {
-                            "current_price": current_underlying_price,
-                            "options_df": options_snapshot_df_full, # Use the full snapshot for selection
-                            "iv_rank": md.current_iv_rank, # Use the global IV rank
-                            "config": CONFIG # Pass global config for strategy params
-                        }
-
-                        # Call strategy logic to get a potential trade action
-                        # This part needs careful integration with strategy.execute()
-                        # For now, simulate the decision part of the strategy:
-                        current_trade_action = option_strategy.execute(market_data_obj=md, ml_model_output=ml_output_for_strategy)
-
-                        if current_trade_action and current_trade_action.get("action") not in [None, "hold", "HOLD"]:
-                            option_to_trade_details = current_trade_action.get("details")
-                            if option_to_trade_details:
-                                # Position Sizing (simplified for options here)
-                                # Option premium is per share. Total cost = premium * 100 * num_contracts
-                                premium_per_share = option_to_trade_details.get("estimated_cost", 0)
-                                # Risk manager for option trades based on max premium risk
-                                # TODO: Instantiate RiskManager correctly
-                                temp_risk_manager = RiskManager(total_capital=cash) # Use current cash for sizing
-                                
-                                size_params = temp_risk_manager.PositionSizeParams(
-                                    trade_type="option",
-                                    option_premium=premium_per_share,
-                                    model_confidence_scalar=ml_signal_proba_up if option_to_trade_details.get("optionType") == 'call' else (1.0 - ml_signal_proba_up if ml_signal_proba_up is not None else 0.5)
-                                )
-                                num_contracts_to_trade = temp_risk_manager.calculate_position_size(size_params)
-                                
-                                if num_contracts_to_trade > 0:
-                                    total_trade_cost = premium_per_share * 100 * num_contracts_to_trade + (transaction_cost_options * num_contracts_to_trade)
-                                    if cash >= total_trade_cost:
-                                        active_option_trade = option_to_trade_details # Store chosen option's full details
-                                        option_entry_date = current_date
-                                        option_purchase_price_per_share = premium_per_share
-                                        option_quantity = num_contracts_to_trade
-                                        
-                                        cash -= total_trade_cost # Deduct cost of trade (premium + entry transaction cost)
-                                        current_holdings_value = premium_per_share * 100 * option_quantity # Initial value of holding
-                                        
-                                        print(f"  {current_date.date()}: Entered {option_quantity} contracts of {active_option_trade['contractSymbol']} "
-                                              f"at {premium_per_share:.2f}. Cost: {total_trade_cost:.2f}. Cash left: {cash:.2f}")
-                                    else:
-                                        print(f"  {current_date.date()}: Insufficient cash for option trade. Need {total_trade_cost:.2f}, have {cash:.2f}")
+                # Use MLTradingStrategy to generate signal
+                # The market_data_for_strategy's internal state will be updated by generate_signal -> _get_latest_features
+                # to reflect data up to current_date (or rather, previous day for feature generation)
+                current_trade_action = ml_strategy_fold.generate_signal()
+                action_type = current_trade_action.get("action")
+                
+                if action_type and action_type not in [ACTION_HOLD, "hold", "HOLD", None]: # Check if action is not HOLD
+                    option_details_from_signal = current_trade_action.get("details")
+                    if option_details_from_signal:
+                        premium_per_share = option_details_from_signal.get("estimated_premium", 0)
+                        if premium_per_share <= 0: # Cannot trade if premium is not positive
+                            print(f"  {current_date.date()}: Estimated premium is {premium_per_share:.2f} for {option_details_from_signal.get('symbol')}, cannot enter trade. Signal: {action_type}")
+                        else:
+                            # Position Sizing
+                            # For MLTradingStrategy, confidence could be derived from model's raw output if it were probabilities
+                            # For now, using a fixed confidence for buy/sell signals from ternary model
+                            model_confidence_for_sizing = 0.75 # Default confidence for BUY_CALL/BUY_PUT
+                            if option_details_from_signal.get("ml_prediction_raw") == 0: # Should not happen if action_type is not HOLD
+                                model_confidence_for_sizing = 0.5 
+                            
+                            temp_risk_manager = RiskManager(total_capital=cash, config=CONFIG) # Pass CONFIG to RiskManager
+                            
+                            size_params = temp_risk_manager.PositionSizeParams(
+                                trade_type="option",
+                                option_premium=premium_per_share,
+                                model_confidence_scalar=model_confidence_for_sizing,
+                                current_price=current_underlying_price, # Pass current underlying price
+                                # Add other params as required by your RiskManager's calculate_position_size
+                            )
+                            num_contracts_to_trade = temp_risk_manager.calculate_position_size(size_params)
+                            
+                            if num_contracts_to_trade > 0:
+                                total_trade_cost = premium_per_share * 100 * num_contracts_to_trade + (transaction_cost_options * num_contracts_to_trade)
+                                if cash >= total_trade_cost:
+                                    # Construct active_option_trade from signal details
+                                    active_option_trade = {
+                                        'contractSymbol': f"{symbol}{current_date.strftime('%y%m%d')}{option_details_from_signal['optionType'][0].upper()}{int(option_details_from_signal['strike_price']*1000):08d}", # Example symbol
+                                        'strike': option_details_from_signal['strike_price'],
+                                        'optionType': option_details_from_signal['optionType'], # 'call' or 'put'
+                                        'estimated_premium_on_entry': premium_per_share # Store the estimated premium
+                                        # Add other details like DTE if needed for P&L or exit logic later
+                                    }
+                                    option_entry_date = current_date
+                                    option_purchase_price_per_share = premium_per_share # This is the actual entry premium (estimated)
+                                    option_quantity = num_contracts_to_trade
+                                    
+                                    cash -= total_trade_cost
+                                    current_holdings_value = premium_per_share * 100 * option_quantity
+                                    
+                                    print(f"  {current_date.date()}: Entered {option_quantity} contracts of {active_option_trade['contractSymbol']} "
+                                          f"({active_option_trade['optionType']}) at {premium_per_share:.2f}. Cost: {total_trade_cost:.2f}. Cash left: {cash:.2f}. Reason: {option_details_from_signal.get('reason')}")
                                 else:
-                                    print(f"  {current_date.date()}: Position size is 0 for potential option trade. Skipping.")
+                                    print(f"  {current_date.date()}: Insufficient cash for option trade. Need {total_trade_cost:.2f}, have {cash:.2f}. Signal: {action_type}")
+                            else:
+                                print(f"  {current_date.date()}: Position size is 0 for potential option trade. Signal: {action_type}")
+                    else:
+                        print(f"  {current_date.date()}: Action {action_type} but no details from MLTradingStrategy. Holding.")
+                # else:
+                    # This case means MLTradingStrategy returned ACTION_HOLD or similar
+                    # print(f"  {current_date.date()}: MLTradingStrategy signals HOLD.")
             
             # Update equity curve for the day
             equity_curve[current_date] = cash + current_holdings_value # current_holdings_value is mark-to-market of option

@@ -153,6 +153,11 @@ class MarketData:
         self.data["volume_sma_5"] = vol.rolling(5).mean()
         self.data["volume_ratio"] = vol / self.data["volume_sma_5"]
 
+        # Annualized Volatility (e.g., 20-day rolling)
+        log_returns = np.log(close / close.shift(1))
+        self.data["annualized_volatility_20"] = log_returns.rolling(window=20).std() * np.sqrt(252)
+
+
         # Drop rows with NaNs created by indicators with different window sizes
         self.data.dropna(inplace=True)  # Ensure data is clean after all indicators are calculated
 
@@ -347,3 +352,63 @@ class MarketData:
             f"Data not available or 'Close' column missing/empty for Volatility calculation for {self.symbol}."
         )
         return pd.Series(dtype="float64")
+
+    def prepare_features_and_labels(
+        self, prediction_horizon=1, dynamic_threshold_factor=0.5
+    ):
+        """
+        Prepares features (X) and ternary labels (y) for machine learning.
+
+        Args:
+            prediction_horizon (int): Number of periods to look ahead for returns.
+            dynamic_threshold_factor (float): Factor to multiply with rolling std 
+                                             to set dynamic thresholds.
+        Returns:
+            pd.DataFrame, pd.Series: Features (X) and labels (y)
+        """
+        if not self._has_valid_close_data:
+            print(
+                f"Cannot prepare features and labels for {self.symbol}: Data not fetched or empty."
+            )
+            return pd.DataFrame(), pd.Series(dtype="float64")
+
+        # Calculate future percentage return
+        self.data["future_return"] = (
+            self.data["Close"].shift(-prediction_horizon) / self.data["Close"]
+        ) - 1
+
+        # Calculate rolling standard deviation of daily returns as a proxy for volatility
+        # Using a window that's relevant to the prediction horizon, e.g., 20 days
+        # Assign to a temporary column to help with NaN handling
+        self.data["_rolling_std_temp"] = (
+            self.data["Close"].pct_change().rolling(window=20).std()
+        )
+
+        # Calculate dynamic thresholds
+        positive_threshold = dynamic_threshold_factor * self.data["_rolling_std_temp"]
+        negative_threshold = -dynamic_threshold_factor * self.data["_rolling_std_temp"]
+
+        # Apply ternary labeling
+        conditions = [
+            self.data["future_return"] > positive_threshold,  # NaNs in positive_threshold will lead to False here
+            self.data["future_return"] < negative_threshold,  # NaNs in negative_threshold will lead to False here
+        ]
+        choices = [1, -1]  # 1 for up, -1 for down
+        self.data["label"] = np.select(conditions, choices, default=0)  # 0 for neutral
+
+        # Prepare X and y
+        # Drop rows with NaNs that were created by future return calculation,
+        # rolling_std calculation (affecting thresholds), or if label somehow becomes NaN.
+        self.data.dropna(
+            subset=["future_return", "_rolling_std_temp", "label"], inplace=True
+        )
+        
+        # Features are all columns except 'future_return', 'label', and the temporary std column
+        X = self.data.drop(columns=["future_return", "label", "_rolling_std_temp"])
+        y = self.data["label"]
+
+        if X.empty or y.empty:
+            print(f"No data left for {self.symbol} after preparing features and labels. Check data and parameters.")
+            return pd.DataFrame(), pd.Series(dtype="float64")
+            
+        return X, y
